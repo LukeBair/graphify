@@ -2300,6 +2300,52 @@ def test_objc_selector_substring_method_exact_match(tmp_path):
     assert ("-run", "-reallyDoThing") not in sel_calls
 
 
+def test_objc_c_function_definitions_extracted(tmp_path):
+    """A `.m` made of C-style functions (JNI/FFM bridge code, no @interface or
+    @implementation) must yield function nodes and their calls, not zero symbols.
+    `walk()` had no `function_definition` branch, so every top-level C function in
+    an ObjC file was recursed into and silently dropped."""
+    p = tmp_path / "bridge.m"
+    p.write_text(
+        '#import "bridge.h"\n'
+        "static int helper(int x) { return x + 1; }\n"
+        "int bridge_run(Ctx *ctx, int n) {\n"
+        "    return helper(n) + external_c(n);\n"
+        "}\n"
+        "id<MTLBuffer> bridge_buf(Ctx *ctx) {\n"
+        "    @autoreleasepool { return [ctx newBufferWithLength:4]; }\n"
+        "}\n"
+        "@implementation Foo\n"
+        "- (void)go { helper(1); }\n"
+        "@end\n"
+    )
+    r = extract_objc(p)
+    by_label = {n["label"]: n for n in r["nodes"]}
+    for label in ("helper()", "bridge_run()", "bridge_buf()"):
+        assert label in by_label, f"{label} missing: {sorted(by_label)}"
+        assert by_label[label].get("_callable") is True
+        assert by_label[label]["source_location"].startswith("L")
+    file_nid = next(n["id"] for n in r["nodes"] if n["label"] == "bridge.m")
+    contains = {e["target"] for e in r["edges"]
+                if e["relation"] == "contains" and e["source"] == file_nid}
+    assert by_label["helper()"]["id"] in contains
+    assert by_label["bridge_run()"]["id"] in contains
+    nid2label = {n["id"]: n["label"] for n in r["nodes"]}
+    calls = {(nid2label[e["source"]], nid2label[e["target"]]): e for e in r["edges"]
+             if e["relation"] == "calls"}
+    assert calls[("bridge_run()", "helper()")]["confidence"] == "EXTRACTED"
+    # a method calling a same-file C helper links too
+    assert ("-go", "helper()") in calls
+    # a callee defined elsewhere is parked for the cross-file resolver
+    assert any(rc["callee"] == "external_c"
+               and rc["caller_nid"] == by_label["bridge_run()"]["id"]
+               and not rc["is_member_call"] for rc in r["raw_calls"])
+    # a message send inside a function body is typed for the resolver (not dropped)
+    assert any(rc["callee"] == "newBufferWithLength"
+               and rc["caller_nid"] == by_label["bridge_buf()"]["id"]
+               for rc in r["raw_calls"])
+
+
 # ---------------------------------------------------------------------------
 # Go
 # ---------------------------------------------------------------------------

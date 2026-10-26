@@ -426,6 +426,21 @@ def extract_objc(path: Path) -> dict:
 
     macro_enums = _macro_enum_members()
 
+    # name -> node id of every C function defined in this file, for same-file C calls.
+    c_function_nids: dict[str, str] = {}
+
+    def _c_function_name(decl) -> str | None:
+        """Innermost identifier of a C function declarator (``*name(args)`` ->
+        ``name``), unwrapping pointer/function declarators like the C extractor."""
+        while decl is not None:
+            if decl.type == "identifier":
+                return _read(decl)
+            inner = decl.child_by_field_name("declarator")
+            if inner is None:
+                inner = next((c for c in decl.children if c.type == "identifier"), None)
+            decl = inner
+        return None
+
     def walk(node, parent_nid: str | None = None) -> None:
         t = node.type
         line = node.start_point[0] + 1
@@ -620,6 +635,26 @@ def extract_objc(path: Path) -> dict:
                     method_bodies.append((method_nid, node, container))
             return
 
+        if t == "function_definition":
+            # A top-level C function in an ObjC file (`int f(void) { ... }`,
+            # `static id<MTLBuffer> g(Ctx *c) { ... }`). JNI/FFM bridge `.m` files are
+            # made of nothing else, and with no branch here the recursion fell through
+            # every one of them, so such a file yielded zero symbols. Shape matches the
+            # generic C extractor: id `_make_id(stem, name)`, label `name()`, `contains`
+            # edge from the file node. The body joins the call pass with the FILE as its
+            # container (there is no class), so message sends and C calls inside it are
+            # resolved like those in a method body.
+            c_name = _c_function_name(node.child_by_field_name("declarator"))
+            if c_name:
+                func_nid = _make_id(stem, c_name)
+                add_node(func_nid, f"{c_name}()", line, _CALLABLE)
+                add_edge(file_nid, func_nid, "contains", line)
+                c_function_nids[c_name] = func_nid
+                body = node.child_by_field_name("body")
+                if body is not None:
+                    method_bodies.append((func_nid, body, file_nid))
+            return
+
         if t == "type_definition":
             # `typedef enum { ... } Name;` / `typedef enum Tag { ... } Name;`.
             # The enum body sits on a child enum_specifier that carries no usable
@@ -663,7 +698,10 @@ def extract_objc(path: Path) -> dict:
         _emit_enum(None, name, line, members)
 
     # Second pass: resolve calls inside method bodies
-    all_method_nids = {n["id"] for n in nodes if n["id"] != file_nid}
+    # C functions are not message targets: leave them out of the selector suffix match
+    # below so `[x readable]` cannot link to a C function named `readable`.
+    all_method_nids = {n["id"] for n in nodes
+                       if n["id"] != file_nid and n["id"] not in c_function_nids.values()}
     class_method_nids: dict[str, set[str]] = {}
     for m_nid, _, container_nid in method_bodies:
         class_method_nids.setdefault(container_nid, set()).add(m_nid)
@@ -756,7 +794,30 @@ def extract_objc(path: Path) -> dict:
                                 "receiver_kind": "self_field",
                                 "lang": "objc",
                             })
-            elif n.type == "field_expression":
+            elif n.type == "call_expression":
+                # Plain C call `helper(x)` (from a C function or an ObjC method). A
+                # callee defined in this file is an EXTRACTED `calls` edge, as in the
+                # C extractor; any other name is parked for the cross-file resolver
+                # (it drops names no corpus file defines, e.g. NSLog).
+                fn = n.child_by_field_name("function")
+                if fn is not None and fn.type == "identifier":
+                    c_name = _read(fn)
+                    tgt = c_function_nids.get(c_name)
+                    call_line = n.start_point[0] + 1
+                    if tgt is None:
+                        raw_calls.append({
+                            "caller_nid": caller_nid,
+                            "callee": c_name,
+                            "is_member_call": False,
+                            "source_file": str_path,
+                            "source_location": f"L{call_line}",
+                            "receiver": None,
+                        })
+                    elif tgt != caller_nid and (caller_nid, tgt) not in seen_calls:
+                        seen_calls.add((caller_nid, tgt))
+                        add_edge(caller_nid, tgt, "calls", call_line,
+                                 confidence="EXTRACTED", weight=1.0, context="call")
+            elif n.type == "field_expression" and container_nid != file_nid:
                 # self.name / self.product.name — dot-syntax sugar for [self name].
                 # Resolve to a sibling method of the SAME class, matched by EXACT
                 # node id (a method id is _make_id(container, name)). A suffix
